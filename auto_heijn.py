@@ -81,10 +81,18 @@ def main():
     parser.add_argument("--search", metavar="NAME", help="list AH product ids for NAME")
     parser.add_argument("--map", nargs=2, metavar=("NAME", "ID"),
                         help="always use product ID for items called NAME (ID 'none': not from AH)")
+    parser.add_argument("--prefer", metavar="TEXT",
+                        help="add a preference that beats price and health, e.g. \"Hellmann's for mayonnaise\"")
+    parser.add_argument("--preferences", action="store_true", help="list the preferences")
+    parser.add_argument("--unprefer", type=int, metavar="N", help="remove preference N")
     args = parser.parse_args()
     if args.search:
         for hit in call("/api/search?" + urllib.parse.urlencode({"q": args.search}))["hits"]:
             print(hit["id"], hit["label"])
+    elif args.prefer or args.preferences or args.unprefer is not None:
+        body = {"add": args.prefer} if args.prefer else {"remove": args.unprefer} if args.unprefer is not None else None
+        for n, text in enumerate(call("/api/preferences", body)["preferences"], 1):
+            print(n, text)
     elif args.map:
         name, pid = args.map
         call("/api/mappings", {"name": name, "id": None if pid.lower() == "none" else int(pid)})
