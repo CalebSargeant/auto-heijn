@@ -125,3 +125,18 @@ python3 -m unittest                           # tests, from a checkout
 
 - If AH takes the items but its answer times out, the next run adds them again.
 - How long AH keeps a login alive is unknown.
+
+## Roadmap
+
+The goal is a shopping assistant that keeps you on budget and on your health goals. Planned:
+
+- Meal plans for the week (breakfast, lunch, dinner and snacks), made for a budget and a goal such as
+  losing weight or building muscle. The ingredients go on the list.
+- Meals built around the week's bonus deals, to spend less.
+- Snack swaps: flag snacks that cost a lot or score badly on health, and suggest a cheaper or healthier
+  one.
+- Approve in Slack: you approve or drop a few items before anything is ordered.
+- Delivery: book a slot and check out once you approve the basket, then post the week's recipes and meal
+  plan in the channel. Until this exists, it never checks out.
+- Siri: adding by voice already works, since the list is a Reminders list ("add yoghurt to my shopping
+  list").
