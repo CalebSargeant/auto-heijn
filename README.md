@@ -86,12 +86,13 @@ Account that owns the list.
 
 The server searches AH for each item and has the LLM choose from the results, by these rules in order:
 
-1. It must be the thing on the list. A brand, variety, flavour or size you write is kept.
+1. It must be the thing on the list. A brand, variety, flavour or size you write is kept. A multipack
+   only when you ask for several.
 2. Your preferences win, even over a cheaper or healthier product.
-3. Health: a better Nutri-Score (A best, E worst). With equal scores, more protein, then fat over
-   carbohydrates, then fewer calories. A clearly healthier product may cost a bit more.
-4. Price per kg, litre or piece, counting bonus prices.
-5. Something you bought before, then the usual pack size.
+3. Price per kg, litre or piece, counting bonus prices.
+4. Health, among products at about the same price: a better Nutri-Score (A best, E worst). With equal
+   scores, more protein, then fat over carbohydrates, then fewer calories.
+5. Something you bought before.
 
 Prices and bonuses change every week, so the server makes a pick again once it is a week old. Products
 you set with `--map` stay.

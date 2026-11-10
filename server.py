@@ -54,12 +54,12 @@ You get the entry, the household's preferences, and numbered candidates from AH'
 their price, bonus, Nutri-Score and nutrition per 100 g or ml where AH has them.
 Pick the product the household most likely means, using these rules in order:
 1. It must be the thing on the list. Keep any brand, variety, flavour, fat level or size the entry names.
+   Pick a multipack only when the entry asks for several.
 2. Follow the household's preferences, even when another product is cheaper or healthier.
-3. Health: prefer a better Nutri-Score (A best, E worst). With equal scores, prefer more protein, then fat
-   over carbohydrates, then fewer kcal. A clearly healthier product is worth a somewhat higher price.
-4. Price: otherwise pick the lowest price per kg, litre or piece, counting bonus prices.
-5. Then prefer a product bought before, then the usual single-pack size. Pick a multipack only when the
-   entry asks for several.
+3. Price: pick the lowest price per kg, litre or piece, counting bonus prices.
+4. Health: among products at about the same price per unit, prefer a better Nutri-Score (A best, E worst).
+   With equal scores, prefer more protein, then fat over carbohydrates, then fewer kcal.
+5. Then prefer a product bought before.
 Answer with JSON only: {"pick": <candidate number or null>, "sure": <true or false>, "search": "<Dutch search words>", "why": "<a few words>"}
 pick is null when no candidate is the thing on the list; then give search words that would find it.
 sure is false when the entry is ambiguous or no candidate clearly fits."""
