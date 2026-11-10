@@ -72,38 +72,38 @@ Account that owns the list.
 
 1. Add items to the list as usual. `2x melk`, `melk x2` and `melk 2x` mean two.
 2. Within a few minutes the item is in the AH basket, Slack says so, and the reminder is ticked.
-3. Items the server isn't sure about stay open, and Slack lists them with its best guess. Fix one with
-
-   ```sh
-   auto-heijn --search "pindakaas"          # find the product id
-   auto-heijn --map "pindakaas" 220739      # always use that product
-   auto-heijn --map "shampoo" none          # not from AH: leave it alone
-   ```
-
+3. Items the server isn't sure about stay open, and Slack lists them with its best guess. Fix one with a
+   `map` command in the channel.
 4. Check out on ah.nl or in the AH app.
+
+## Slack commands
+
+Post these in the channel. The server reads it whenever the bridge syncs, so the answer, in a thread
+under your message, can take a few minutes. Other messages are left alone.
+
+| Post | |
+|---|---|
+| `search pindakaas` | AH products with their ids. |
+| `map pindakaas 220739` | Always use that product for "pindakaas". |
+| `map shampoo none` | Not from AH: leave it on the list. |
+| `prefer Hellmann's for mayonnaise` | Add a preference. Preferences beat price and health. |
+| `preferences` | List the preferences, numbered. |
+| `unprefer 1` | Remove preference 1. |
 
 ## How it picks
 
 The server searches AH for each item and has the LLM choose from the results, by these rules in order:
 
-1. It must be the thing on the list. A brand, variety, flavour or size you write is kept. A multipack
-   only when you ask for several.
+1. It must be the thing on the list. A brand, variety, flavour or size you write is kept.
 2. Your preferences win, even over a cheaper or healthier product.
-3. Price per kg, litre or piece, counting bonus prices.
+3. Price per kg, litre or piece, counting bonus prices. A bigger pack or a multipack wins when it is
+   cheaper per unit.
 4. Health, among products at about the same price: a better Nutri-Score (A best, E worst). With equal
    scores, more protein, then fat over carbohydrates, then fewer calories.
 5. Something you bought before.
 
-Prices and bonuses change every week, so the server makes a pick again once it is a week old. Products
-you set with `--map` stay.
-
-```sh
-auto-heijn --prefer "Hellmann's for mayonnaise"   # add a preference
-auto-heijn --preferences                           # list them, numbered
-auto-heijn --unprefer 1                            # remove preference 1
-```
-
-Changing the preferences makes the server redo its own picks.
+Prices and bonuses change every week, so the server makes a pick again once it is a week old, or when
+the preferences change. Products you set with `map` stay.
 
 ## Specials
 

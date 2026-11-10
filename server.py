@@ -54,9 +54,9 @@ You get the entry, the household's preferences, and numbered candidates from AH'
 their price, bonus, Nutri-Score and nutrition per 100 g or ml where AH has them.
 Pick the product the household most likely means, using these rules in order:
 1. It must be the thing on the list. Keep any brand, variety, flavour, fat level or size the entry names.
-   Pick a multipack only when the entry asks for several.
 2. Follow the household's preferences, even when another product is cheaper or healthier.
-3. Price: pick the lowest price per kg, litre or piece, counting bonus prices.
+3. Price: pick the lowest price per kg, litre or piece, counting bonus prices. A bigger pack or a
+   multipack is fine when it is cheaper per unit.
 4. Health: among products at about the same price per unit, prefer a better Nutri-Score (A best, E worst).
    With equal scores, prefer more protein, then fat over carbohydrates, then fewer kcal.
 5. Then prefer a product bought before.
@@ -438,6 +438,57 @@ def accepted_specials(con):
     return [row for row in rows if row[1] in ticked]
 
 
+HELP = """Post one of these here:
+search pindakaas: AH products with their ids
+map pindakaas 220739: always use that product (map shampoo none: not from AH)
+prefer Hellmann's for mayonnaise: a preference that beats price and health
+preferences: list the preferences
+unprefer 2: remove preference 2"""
+COMMAND = re.compile(r"(search|map|prefer|preferences|unprefer|help)\b\s*(.*)", re.I | re.S)
+
+
+def command(con, text, token=None):
+    """The answer to one message in the channel, or None when it isn't a command."""
+    found = COMMAND.fullmatch(text)
+    if not found:
+        return None
+    verb, rest = found[1].lower(), found[2].strip()
+    mapping = re.fullmatch(r"(.+?)\s+(\d+|none)", rest, re.I)
+    if verb == "search" and rest:
+        return "\n".join(f'{h["id"]} {h["label"]}' for h in search(rest, token)[:10]) or "Nothing found."
+    if verb == "map" and mapping:
+        pid = None if mapping[2].lower() == "none" else int(mapping[2])
+        return f"{mapping[1]}: {set_mapping(con, mapping[1], pid)}"
+    if verb == "prefer" and rest:
+        prefs = preferences(con, add=rest)
+    elif verb == "unprefer" and rest.isdigit():
+        prefs = preferences(con, remove=int(rest))
+    elif verb == "preferences" and not rest:
+        prefs = preferences(con)
+    else:
+        return HELP
+    return "\n".join(f"{n}. {p}" for n, p in enumerate(prefs, 1)) or "No preferences yet."
+
+
+def commands(con, token=None):
+    """Answer what people posted in the channel since the last run, each in its own thread."""
+    seen = get(con, "slack:seen")
+    if not seen:
+        put(con, "slack:seen", f"{time.time():.6f}")  # start now rather than answer old messages
+        return
+    # shortcut: reads at most 100 new messages per run, plenty for one household's channel
+    out = slack_call("conversations.history", query={"oldest": seen, "limit": 100}) or {}
+    for m in sorted(out.get("messages", []), key=lambda m: float(m["ts"])):
+        if not (m.get("bot_id") or m.get("subtype")):
+            try:
+                answer = command(con, html.unescape(m.get("text", "")).strip(), token)
+            except (OSError, ValueError, KeyError) as e:
+                answer = f"That didn't work: {e}"
+            if answer:
+                slack(answer, m["ts"])
+        put(con, "slack:seen", m["ts"])
+
+
 def alert(con, kind, text):
     """Post text once, and again only when it changes."""
     if get(con, "alert:" + kind) != text:
@@ -462,6 +513,11 @@ def sync(items, dry_run=False):
             token, offline = None, f"auto-heijn can't reach your AH account ({e}). Log in at {PUBLIC_URL}/login."
         except (OSError, ValueError, KeyError) as e:
             token, offline = None, f"AH didn't answer ({e})."
+        if not dry_run:
+            try:
+                commands(con, token)
+            except (OSError, ValueError, KeyError) as e:
+                notes.append(f"slack commands failed: {e}")
         lines, unsure = {}, []
         for item in items:
             if item["id"] in added:
@@ -485,7 +541,7 @@ def sync(items, dry_run=False):
         if new_unsure and not dry_run:
             slack("Not sure about these, so they stay on the list:\n" + "\n".join(
                 f'• {n}: ' + (f'best guess {f["label"]} ({f["id"]})' if f["id"] else "no match")
-                for n, f in new_unsure) + "\nFix one with: auto-heijn --map NAME ID")
+                for n, f in new_unsure) + "\nFix one by posting: map NAME ID")
             for n, _ in new_unsure:
                 sql(con, "update products set told = 1 where name = %s", (n.casefold(),))
             con.commit()
@@ -622,18 +678,6 @@ class Handler(BaseHTTPRequestHandler):
                 req = json.loads(self.body() or b"{}")
                 complete, notes = sync(req.get("items", []), bool(req.get("dry_run")))
                 return self.send(200, {"complete": complete, "log": notes})
-            if url.path == "/api/search":
-                query = urllib.parse.parse_qs(url.query).get("q", [""])[0]
-                return self.send(200, {"hits": search(query)})
-            if url.path == "/api/mappings" and self.command == "POST":
-                req = json.loads(self.body() or b"{}")
-                pid = None if req.get("id") is None else int(req["id"])
-                with LOCK, connect() as con:
-                    return self.send(200, {"label": set_mapping(con, req["name"], pid)})
-            if url.path == "/api/preferences":
-                req = json.loads(self.body() or b"{}") if self.command == "POST" else {}
-                with LOCK, connect() as con:
-                    return self.send(200, {"preferences": preferences(con, req.get("add"), req.get("remove"))})
             if url.path in ("/", "/login") and self.command == "GET":
                 with LOCK, connect() as con:  # LOCK: AH rotates the refresh token, so refresh one at a time
                     page = PAGE.format(status=html.escape(status(con)),

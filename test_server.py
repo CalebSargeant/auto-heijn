@@ -31,6 +31,7 @@ class Sync(unittest.TestCase):
             mock.patch.object(server, "nutrition", return_value={}),
             mock.patch.object(server, "offer_specials"),
             mock.patch.object(server, "accepted_specials", return_value=[]),
+            mock.patch.object(server, "commands"),
             mock.patch.object(server, "log"),
         ]
         for patch in patches:
@@ -145,6 +146,41 @@ class Picks(unittest.TestCase):
         self.assertEqual(server.preferences(self.con, remove=1), [])
         with self.assertRaises(ValueError):
             server.preferences(self.con, remove=1)
+
+
+class Commands(unittest.TestCase):
+    def setUp(self):
+        self.con = fresh_db(self)
+        self.replies, self.history = [], []
+        hits = [{"id": 220739, "label": "Calvé Pindakaas (350 g)"}]
+        for patch in (mock.patch.object(server, "slack", side_effect=self.reply),
+                      mock.patch.object(server, "slack_call", side_effect=self.history_since),
+                      mock.patch.object(server, "search", return_value=hits),
+                      mock.patch.object(server, "lookup", return_value=hits[0]["label"])):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def reply(self, text, thread=None):
+        self.replies.append((text, thread))
+
+    def history_since(self, method, body=None, query=None):
+        return {"ok": True, "messages": [m for m in self.history if float(m["ts"]) > float(query["oldest"])]}
+
+    def test_commands_in_the_channel_are_answered_in_their_thread(self):
+        server.commands(self.con)  # the first run only notes where to start
+        now = time.time()
+        texts = ["Map pindakaas 220739", "map shampoo none", "search pindakaas", "prefer M&amp;M's for chocolate",
+                 "unprefer 5", "what's for dinner?"]
+        self.history = [{"ts": f"{now + n + 1:.6f}", "user": "UPERSON", "text": t} for n, t in enumerate(texts)]
+        self.history.append({"ts": f"{now + 9:.6f}", "user": "UBOT", "bot_id": "B1", "text": "map melk 1"})
+        server.commands(self.con)
+        server.commands(self.con)  # nothing is answered twice
+        self.assertEqual([thread for _, thread in self.replies], [m["ts"] for m in self.history[:5]])
+        answers = [text for text, _ in self.replies]
+        self.assertEqual(answers[:4], ["pindakaas: Calvé Pindakaas (350 g)", "shampoo: not from AH",
+                                       "220739 Calvé Pindakaas (350 g)", "1. M&M's for chocolate"])
+        self.assertIn("no preference 5", answers[4])
+        self.assertEqual(server.product(self.con, "pindakaas")["id"], 220739)
 
 
 class Specials(unittest.TestCase):
