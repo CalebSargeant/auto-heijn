@@ -34,7 +34,7 @@ docker run -p 8080:8080 -e BRIDGE_TOKEN=... -e DATABASE_URL=... ghcr.io/calebsar
 | `AH_WRITE` | `true` to add to the basket. Default `false`: it reads the basket and reports what it would add. |
 | `PUBLIC_URL` | The server's address, used in Slack messages. |
 | `LLM_URL`, `LLM_MODEL`, `LLM_API_KEY` | An OpenAI-compatible chat endpoint (`/v1/chat/completions`). |
-| `SLACK_BOT_TOKEN`, `SLACK_CHANNEL` | Where it posts. The bot needs `chat:write` and must be in the channel. |
+| `SLACK_BOT_TOKEN`, `SLACK_CHANNEL` | Where it posts. The bot needs `chat:write`, `reactions:write` and `channels:history` (`groups:history` for a private channel), and must be in the channel. |
 | `PORT` | Default `8080`. |
 
 Run it where AH sees a home internet connection. AH's bot protection is stricter with datacenter
@@ -72,15 +72,46 @@ Account that owns the list.
 
 1. Add items to the list as usual. `2x melk`, `melk x2` and `melk 2x` mean two.
 2. Within a few minutes the item is in the AH basket, Slack says so, and the reminder is ticked.
-3. Items the server isn't sure about stay open, and Slack lists them with its best guess. Fix one with
-
-   ```sh
-   auto-heijn --search "pindakaas"          # find the product id
-   auto-heijn --map "pindakaas" 220739      # always use that product
-   auto-heijn --map "shampoo" none          # not from AH: leave it alone
-   ```
-
+3. Items the server isn't sure about stay open, and Slack lists them with its best guess. Fix one with a
+   `map` command in the channel.
 4. Check out on ah.nl or in the AH app.
+
+## Slack commands
+
+Post these in the channel. The server reads it whenever the bridge syncs, so the answer, in a thread
+under your message, can take a few minutes. Other messages are left alone.
+
+| Post | |
+|---|---|
+| `search pindakaas` | AH products with their ids. |
+| `map pindakaas 220739` | Always use that product for "pindakaas". |
+| `map shampoo none` | Not from AH: leave it on the list. |
+| `prefer Hellmann's for mayonnaise` | Add a preference. Preferences beat price and health. |
+| `preferences` | List the preferences, numbered. |
+| `unprefer 1` | Remove preference 1. |
+
+## How it picks
+
+The server searches AH for each item and has the LLM choose from the results, by these rules in order:
+
+1. It must be the thing on the list. A brand, variety, flavour or size you write is kept.
+2. Your preferences win, even over a cheaper or healthier product.
+3. Price per kg, litre or piece, counting bonus prices. A bigger pack or a multipack wins when it is
+   cheaper per unit.
+4. Health, among products at about the same price: a better Nutri-Score (A best, E worst). With equal
+   scores, more protein, then fat over carbohydrates, then fewer calories.
+5. Something you bought before.
+
+Prices and bonuses change every week, so the server makes a pick again once it is a week old, or when
+the preferences change. Products you set with `map` stay.
+
+## Specials
+
+Once per bonus week (Monday to Sunday), Slack lists the products it has matched for your list before
+that are on bonus, in a thread with a 🛒 under each. Tap the 🛒 (or add ✅, ✔️ or 👍) and the next run
+adds one to the AH basket and marks it ✅. The same checks apply as for the list: nothing is added while
+an order is open or a delivery is booked, or while `AH_WRITE` is off. Deals that run longer than two
+more weeks, such as standing volume discounts, are left out.
 
 ## Run by hand
 

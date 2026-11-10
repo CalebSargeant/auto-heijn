@@ -10,7 +10,6 @@ import os
 import subprocess
 import sys
 import time
-import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -78,19 +77,7 @@ def sync(dry_run=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dry-run", action="store_true", help="show what the server would do, change nothing")
-    parser.add_argument("--search", metavar="NAME", help="list AH product ids for NAME")
-    parser.add_argument("--map", nargs=2, metavar=("NAME", "ID"),
-                        help="always use product ID for items called NAME (ID 'none': not from AH)")
-    args = parser.parse_args()
-    if args.search:
-        for hit in call("/api/search?" + urllib.parse.urlencode({"q": args.search}))["hits"]:
-            print(hit["id"], hit["label"])
-    elif args.map:
-        name, pid = args.map
-        call("/api/mappings", {"name": name, "id": None if pid.lower() == "none" else int(pid)})
-        print(f"{name}: {pid}")
-    else:
-        sync(args.dry_run)
+    sync(parser.parse_args().dry_run)
 
 
 if __name__ == "__main__":

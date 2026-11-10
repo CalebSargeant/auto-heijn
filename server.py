@@ -41,6 +41,8 @@ SCHEMA = [
     " source text, told integer default 0, ts double precision)",
     "create table if not exists added (reminder text primary key, name text, id bigint, qty integer,"
     " ts double precision)",
+    "create table if not exists specials (id bigint, week text, ts text, label text, added integer default 0,"
+    " primary key (id, week))",
 ]
 QUANTITY = [re.compile(p, re.I) for p in (
     r"(?P<n>\d+)\s*[x×]\s+(?P<name>.+)",
@@ -48,14 +50,22 @@ QUANTITY = [re.compile(p, re.I) for p in (
     r"(?P<name>.+?)\s+(?P<n>\d+)\s*[x×]",
 )]
 MATCH = """You match one entry from a Dutch household shopping list to a product at Albert Heijn.
-You get the entry and numbered candidates from AH's product search; some are marked [bought before].
-Pick the product the household most likely means:
-- Keep any brand, variety, fat level, flavour or size the entry names.
-- Otherwise prefer a product bought before, then AH's own brand, then the usual single-pack size.
-- Pick a multipack only when the entry asks for several.
-Answer with JSON only: {"pick": <candidate number or null>, "sure": <true or false>, "search": "<Dutch search words>"}
+You get the entry, the household's preferences, and numbered candidates from AH's product search with
+their price, bonus, Nutri-Score and nutrition per 100 g or ml where AH has them.
+Pick the product the household most likely means, using these rules in order:
+1. It must be the thing on the list. Keep any brand, variety, flavour, fat level or size the entry names.
+2. Follow the household's preferences, even when another product is cheaper or healthier.
+3. Price: pick the lowest price per kg, litre or piece, counting bonus prices. A bigger pack or a
+   multipack is fine when it is cheaper per unit.
+4. Health: among products at about the same price per unit, prefer a better Nutri-Score (A best, E worst).
+   With equal scores, prefer more protein, then fat over carbohydrates, then fewer kcal.
+5. Then prefer a product bought before.
+Answer with JSON only: {"pick": <candidate number or null>, "sure": <true or false>, "search": "<Dutch search words>", "why": "<a few words>"}
 pick is null when no candidate is the thing on the list; then give search words that would find it.
 sure is false when the entry is ambiguous or no candidate clearly fits."""
+STALE = 7 * 86400  # prices and bonuses change weekly, so a pick older than this is made again
+TICKS = {"shopping_trolley", "white_check_mark", "heavy_check_mark", "+1"}
+NUTRIENTS = {"ENER-": "energy", "PRO-": "protein", "FAT": "fat", "CHOAVL": "carbs", "SUGAR-": "sugar"}
 LOCK = threading.Lock()
 
 
@@ -186,13 +196,59 @@ def search(query, token=None, size=20):
     """Orderable hits; with a user token AH also marks what the household bought before."""
     q = urllib.parse.urlencode({"query": query, "page": 0, "size": size, "sortOn": "RELEVANCE"})
     hits = ah("/mobile-services/product/search/v2?" + q, token=token or anon_token()).get("products", [])
-    return [{"id": p["webshopId"], "label": label(p), "bought": p.get("isPreviouslyBought") is True}
-            for p in hits if p.get("isOrderable")]
+    return [hit(p) for p in hits if p.get("isOrderable")]
+
+
+def hit(p):
+    deal = bool(p.get("isBonus") and p.get("currentPrice"))  # currentPrice is 0 off bonus
+    return {"id": p["webshopId"], "label": label(p), "bought": p.get("isPreviouslyBought") is True,
+            "price": p["currentPrice"] if deal else p.get("priceBeforeBonus"),
+            "bonus": p.get("bonusMechanism") if deal else None, "until": p.get("bonusEndDate") if deal else None,
+            "nutriscore": p.get("nutriscore")}
+
+
+def products_by_id(ids):
+    out = []
+    for i in range(0, len(ids), 50):
+        q = urllib.parse.urlencode([("ids", pid) for pid in ids[i:i + 50]] + [("sortOn", "INPUT_PRODUCT_IDS")])
+        out += [hit(p) for p in ah("/mobile-services/product/search/v2/products?" + q, token=anon_token()) or []]
+    return out
 
 
 def lookup(pid):
-    hits = ah(f"/mobile-services/product/search/v2/products?ids={pid}&sortOn=INPUT_PRODUCT_IDS", token=anon_token())
-    return next((label(p) for p in hits or [] if p.get("webshopId") == pid), f"product {pid}")
+    return next((h["label"] for h in products_by_id([pid]) if h["id"] == pid), f"product {pid}")
+
+
+def nutrition(ids):
+    """{product id: {"protein": "4.3 g", ...}} per 100 g or ml, in one batched GraphQL query."""
+    if not ids:
+        return {}
+    fields = "tradeItem { nutritions { nutrients { type value } } }"
+    query = "query Nutrition { " + " ".join(f"p{int(i)}: product(id: {int(i)}) {{ {fields} }}" for i in ids) + " }"
+    data = (ah("/graphql", {"query": query}, anon_token()) or {}).get("data") or {}
+    out = {}
+    for key, p in data.items():
+        tables = ((p or {}).get("tradeItem") or {}).get("nutritions") or []
+        if tables:  # the first table is per 100 g or ml, later ones per portion
+            out[int(key[1:])] = {NUTRIENTS[n["type"]]: n["value"] for n in tables[0].get("nutrients") or []
+                                 if n.get("type") in NUTRIENTS}
+    return out
+
+
+def candidates(hits, facts):
+    rows = []
+    for n, h in enumerate(hits, 1):
+        parts = [f'{n}. {h["label"]}']
+        if h.get("price") is not None:
+            parts.append(f'€{h["price"]:.2f}' + (f' on bonus ({h["bonus"]})' if h.get("bonus") else ""))
+        if h.get("nutriscore"):
+            parts.append(f'Nutri-Score {h["nutriscore"]}')
+        if facts.get(h["id"]):
+            parts.append(", ".join(f"{k} {v}" for k, v in facts[h["id"]].items()))
+        if h.get("bought"):
+            parts.append("bought before")
+        rows.append(" | ".join(parts))
+    return "\n".join(rows) or "(none)"
 
 
 def basket(token):
@@ -244,17 +300,22 @@ def llm(system, prompt):
     return json.loads(found.group()) if found else {}
 
 
-def match(name, token=None):
-    """Best AH product for a list entry, as {id, label, sure}; id None when nothing fits."""
+def match(name, token=None, prefs=()):
+    """Best AH product for a list entry, as {id, label, sure, why}; id None when nothing fits."""
     query = name
+    wants = "\n".join(f"- {p}" for p in prefs) or "(none)"
     for _ in range(2):
         hits = search(query, token)
-        lines = [f'{n}. {h["label"]}' + (" [bought before]" if h.get("bought") else "")
-                 for n, h in enumerate(hits, 1)]
-        answer = llm(MATCH, f'Entry: "{name}"\nCandidates:\n' + ("\n".join(lines) or "(none)"))
+        try:
+            facts = nutrition([h["id"] for h in hits])
+        except (OSError, ValueError, KeyError) as e:
+            log(f"no nutrition for {query!r}: {e}")
+            facts = {}
+        answer = llm(MATCH, f'Entry: "{name}"\nHousehold preferences:\n{wants}\nCandidates:\n'
+                     + candidates(hits, facts))
         pick = answer.get("pick")
         if isinstance(pick, int) and 1 <= pick <= len(hits):
-            return dict(hits[pick - 1], sure=answer.get("sure") is True)
+            return dict(hits[pick - 1], sure=answer.get("sure") is True, why=str(answer.get("why") or ""))
         query = str(answer.get("search") or "").strip()
         if not query or query.casefold() == name.casefold():
             break
@@ -263,13 +324,30 @@ def match(name, token=None):
 
 def product(con, name, token=None):
     key = name.casefold()
-    row = sql(con, "select id, label, sure, source, told from products where name = %s", (key,)).fetchone()
-    if row:
+    row = sql(con, "select id, label, sure, source, told, ts from products where name = %s", (key,)).fetchone()
+    if row and (row[3] == "manual" or time.time() - row[5] < STALE):
         return dict(zip(("id", "label", "sure", "source", "told"), row))
-    found = match(name, token)
+    found = match(name, token, preferences(con))
     save_product(con, key, found["id"], found["label"], found["sure"], "llm")
-    log(f"matched {name!r}: {found['label']}{'' if found['sure'] else ' (not sure)'}")
+    log(f"matched {name!r}: {found['label']}{'' if found['sure'] else ' (not sure)'} {found.get('why', '')}")
     return dict(found, source="llm", told=0)
+
+
+def preferences(con, add=None, remove=None):
+    """The household's standing preferences, which beat price and health when matching."""
+    prefs = get(con, "preferences") or []
+    if add is None and remove is None:
+        return prefs
+    if add:
+        prefs.append(" ".join(str(add).split()))
+    if remove is not None:
+        if not 1 <= int(remove) <= len(prefs):
+            raise ValueError(f"there is no preference {remove}")
+        prefs.pop(int(remove) - 1)
+    put(con, "preferences", prefs)
+    sql(con, "update products set ts = 0 where source = 'llm'")  # pick again with the new preferences
+    con.commit()
+    return prefs
 
 
 def save_product(con, key, pid, label, sure, source):
@@ -285,19 +363,130 @@ def set_mapping(con, name, pid):
     return text
 
 
-def slack(text):
+def slack_call(method, body=None, query=None):
+    """Call a Slack Web API method for the channel; None when Slack is off or says no."""
     token = ENV("SLACK_BOT_TOKEN")
     if not (token and SLACK_CHANNEL):
-        log("slack not set up: " + text)
-        return
+        log(f"slack not set up: {method} {body or query}")
+        return None
+    url = "https://slack.com/api/" + method
+    if query is not None:  # read methods take form parameters, not JSON
+        url += "?" + urllib.parse.urlencode(dict(query, channel=SLACK_CHANNEL))
     try:
-        out = http_json("https://slack.com/api/chat.postMessage",
-                        {"channel": SLACK_CHANNEL, "text": text, "unfurl_links": False},
+        out = http_json(url, None if query is not None else dict(body or {}, channel=SLACK_CHANNEL),
                         {"Authorization": "Bearer " + token})
-        if not out.get("ok"):
-            log(f"slack refused the post: {out.get('error')}")
     except OSError as e:
-        log(f"slack post failed: {e}")
+        log(f"slack {method} failed: {e}")
+        return None
+    if not out.get("ok"):
+        log(f"slack {method} refused: {out.get('error')}")
+        return None
+    return out
+
+
+def slack(text, thread=None):
+    """Post to the channel, or into a thread, and return the message's ts."""
+    body = {"text": text, "unfurl_links": False, **({"thread_ts": thread} if thread else {})}
+    return (slack_call("chat.postMessage", body) or {}).get("ts")
+
+
+_bot = {}
+
+
+def bot_user():
+    if not _bot.get("id"):
+        _bot["id"] = (slack_call("auth.test") or {}).get("user_id")
+    return _bot["id"]
+
+
+def week():
+    return time.strftime("%G-W%V")  # AH's bonus week runs Monday to Sunday, like the ISO week
+
+
+def offer_specials(con):
+    """Once a bonus week, post the household's usual products that are on bonus, each with a 🛒 to tap."""
+    if get(con, "specials:week") == week():
+        return
+    ids = [row[0] for row in sql(con, "select distinct id from products where id is not null and sure = 1")]
+    soon = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 14 * 86400))
+    deals = [h for h in products_by_id(ids) if h["bonus"] and (h["until"] or "9") <= soon]  # skips standing deals
+    if deals:
+        thread = slack("On bonus this week, from things that were on your list. "
+                       "Tap 🛒 on one and I'll add it to the AH basket.")
+        if not thread:
+            return  # try again next run
+        for h in deals:
+            ts = slack(f'{h["label"]}: {h["bonus"]}, €{h["price"]:.2f}, until {h["until"]}', thread)
+            if ts:
+                slack_call("reactions.add", {"name": "shopping_trolley", "timestamp": ts})
+                sql(con, "insert into specials values (%s, %s, %s, %s, 0) on conflict do nothing",
+                    (h["id"], week(), ts, h["label"]))
+        put(con, "specials:thread", thread)
+    put(con, "specials:week", week())
+
+
+def accepted_specials(con):
+    """This week's specials someone ticked in Slack that aren't in the basket yet, as (id, ts, label)."""
+    rows = sql(con, "select id, ts, label from specials where week = %s and added = 0", (week(),)).fetchall()
+    thread = get(con, "specials:thread")
+    me = bot_user() if rows and thread else None
+    if not me:  # without the bot's own id its 🛒 would count as a yes
+        return []
+    replies = (slack_call("conversations.replies", query={"ts": thread}) or {}).get("messages", [])
+    ticked = {m["ts"] for m in replies for r in m.get("reactions", [])
+              if r.get("name") in TICKS and set(r.get("users", [])) - {me}}
+    return [row for row in rows if row[1] in ticked]
+
+
+HELP = """Post one of these here:
+search pindakaas: AH products with their ids
+map pindakaas 220739: always use that product (map shampoo none: not from AH)
+prefer Hellmann's for mayonnaise: a preference that beats price and health
+preferences: list the preferences
+unprefer 2: remove preference 2"""
+COMMAND = re.compile(r"(search|map|prefer|preferences|unprefer|help)\b\s*(.*)", re.I | re.S)
+
+
+def command(con, text, token=None):
+    """The answer to one message in the channel, or None when it isn't a command."""
+    found = COMMAND.fullmatch(text)
+    if not found:
+        return None
+    verb, rest = found[1].lower(), found[2].strip()
+    mapping = re.fullmatch(r"(.+?)\s+(\d+|none)", rest, re.I)
+    if verb == "search" and rest:
+        return "\n".join(f'{h["id"]} {h["label"]}' for h in search(rest, token)[:10]) or "Nothing found."
+    if verb == "map" and mapping:
+        pid = None if mapping[2].lower() == "none" else int(mapping[2])
+        return f"{mapping[1]}: {set_mapping(con, mapping[1], pid)}"
+    if verb == "prefer" and rest:
+        prefs = preferences(con, add=rest)
+    elif verb == "unprefer" and rest.isdigit():
+        prefs = preferences(con, remove=int(rest))
+    elif verb == "preferences" and not rest:
+        prefs = preferences(con)
+    else:
+        return HELP
+    return "\n".join(f"{n}. {p}" for n, p in enumerate(prefs, 1)) or "No preferences yet."
+
+
+def commands(con, token=None):
+    """Answer what people posted in the channel since the last run, each in its own thread."""
+    seen = get(con, "slack:seen")
+    if not seen:
+        put(con, "slack:seen", f"{time.time():.6f}")  # start now rather than answer old messages
+        return
+    # shortcut: reads at most 100 new messages per run, plenty for one household's channel
+    out = slack_call("conversations.history", query={"oldest": seen, "limit": 100}) or {}
+    for m in sorted(out.get("messages", []), key=lambda m: float(m["ts"])):
+        if not (m.get("bot_id") or m.get("subtype")):
+            try:
+                answer = command(con, html.unescape(m.get("text", "")).strip(), token)
+            except (OSError, ValueError, KeyError) as e:
+                answer = f"That didn't work: {e}"
+            if answer:
+                slack(answer, m["ts"])
+        put(con, "slack:seen", m["ts"])
 
 
 def alert(con, kind, text):
@@ -308,7 +497,7 @@ def alert(con, kind, text):
 
 
 def describe(line):
-    titles = " + ".join(i["title"] for i in line["items"])
+    titles = " + ".join(i["title"] for i in line["items"]) or "on bonus"
     return f'• {titles}: {line["label"]}' + (f' ×{line["qty"]}' if line["qty"] > 1 else "")
 
 
@@ -324,6 +513,11 @@ def sync(items, dry_run=False):
             token, offline = None, f"auto-heijn can't reach your AH account ({e}). Log in at {PUBLIC_URL}/login."
         except (OSError, ValueError, KeyError) as e:
             token, offline = None, f"AH didn't answer ({e})."
+        if not dry_run:
+            try:
+                commands(con, token)
+            except (OSError, ValueError, KeyError) as e:
+                notes.append(f"slack commands failed: {e}")
         lines, unsure = {}, []
         for item in items:
             if item["id"] in added:
@@ -347,10 +541,19 @@ def sync(items, dry_run=False):
         if new_unsure and not dry_run:
             slack("Not sure about these, so they stay on the list:\n" + "\n".join(
                 f'• {n}: ' + (f'best guess {f["label"]} ({f["id"]})' if f["id"] else "no match")
-                for n, f in new_unsure) + "\nFix one with: auto-heijn --map NAME ID")
+                for n, f in new_unsure) + "\nFix one by posting: map NAME ID")
             for n, _ in new_unsure:
                 sql(con, "update products set told = 1 where name = %s", (n.casefold(),))
             con.commit()
+        if not dry_run:
+            try:
+                offer_specials(con)
+                for pid, ts, text in accepted_specials(con):
+                    line = lines.setdefault(pid, {"label": text, "qty": 0, "items": []})
+                    line["qty"] += 1
+                    line.setdefault("specials", []).append(ts)
+            except (OSError, ValueError, KeyError) as e:
+                notes.append(f"specials failed: {e}")
         if not lines:
             return complete, notes
 
@@ -381,14 +584,23 @@ def sync(items, dry_run=False):
         done = [line for pid, line in lines.items() if after.get(pid, 0) >= want[pid]]
         missing = [line for pid, line in lines.items() if after.get(pid, 0) < want[pid]]
         for pid, line in lines.items():
-            for i in line["items"] if line in done else []:
+            if line not in done:
+                continue
+            for i in line["items"]:
                 sql(con, "insert into added values (%s, %s, %s, %s, %s) on conflict (reminder) do nothing",
                     (i["id"], i["name"], pid, i["qty"], time.time()))
+            for ts in line.get("specials", []):
+                sql(con, "update specials set added = 1 where ts = %s", (ts,))
+                slack_call("reactions.add", {"name": "white_check_mark", "timestamp": ts})
         con.commit()
-        text = "Added to the AH basket:\n" + "\n".join(describe(line) for line in done) if done else ""
-        if missing:
+        text = "Added to the AH basket:\n" + "\n".join(map(describe, done)) if done else ""
+        if done:
+            slack(text)
+        if missing:  # retried every run, so say it once
             text += "\nAH didn't take these, so they stay on the list:\n" + "\n".join(map(describe, missing))
-        slack(text.strip())
+            alert(con, "missing", text.strip())
+        else:
+            put(con, "alert:missing", None)
         complete += [i["id"] for line in done for i in line["items"]]
         return complete, notes + [text.strip()]
 
@@ -466,14 +678,6 @@ class Handler(BaseHTTPRequestHandler):
                 req = json.loads(self.body() or b"{}")
                 complete, notes = sync(req.get("items", []), bool(req.get("dry_run")))
                 return self.send(200, {"complete": complete, "log": notes})
-            if url.path == "/api/search":
-                query = urllib.parse.parse_qs(url.query).get("q", [""])[0]
-                return self.send(200, {"hits": search(query)})
-            if url.path == "/api/mappings" and self.command == "POST":
-                req = json.loads(self.body() or b"{}")
-                pid = None if req.get("id") is None else int(req["id"])
-                with LOCK, connect() as con:
-                    return self.send(200, {"label": set_mapping(con, req["name"], pid)})
             if url.path in ("/", "/login") and self.command == "GET":
                 with LOCK, connect() as con:  # LOCK: AH rotates the refresh token, so refresh one at a time
                     page = PAGE.format(status=html.escape(status(con)),

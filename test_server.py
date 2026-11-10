@@ -28,6 +28,10 @@ class Sync(unittest.TestCase):
             mock.patch.object(server, "basket", side_effect=lambda token: ({}, dict(self.lines))),
             mock.patch.object(server, "add_items", side_effect=self.add_items),
             mock.patch.object(server, "booked", side_effect=lambda token, raw: self.booking),
+            mock.patch.object(server, "nutrition", return_value={}),
+            mock.patch.object(server, "offer_specials"),
+            mock.patch.object(server, "accepted_specials", return_value=[]),
+            mock.patch.object(server, "commands"),
             mock.patch.object(server, "log"),
         ]
         for patch in patches:
@@ -95,6 +99,138 @@ class Sync(unittest.TestCase):
             server.set_mapping(con, "iets raars", None)
         server.sync(self.items)
         self.assertFalse(any("iets raars" in p for p in self.posts))
+
+
+def fresh_db(test):
+    patch = mock.patch.object(server, "DATABASE_URL", os.path.join(tempfile.mkdtemp(), "test.db"))
+    patch.start()
+    test.addCleanup(patch.stop)
+    con = server.connect().thing
+    test.addCleanup(con.close)
+    for statement in server.SCHEMA:
+        server.sql(con, statement)
+    return con
+
+
+class Picks(unittest.TestCase):
+    def setUp(self):
+        self.con, self.prompts = fresh_db(self), []
+        hits = [{"id": 1, "label": "Hellmann's Mayonaise (430 ml)", "price": 3.49, "bonus": "2e halve prijs",
+                 "nutriscore": "E", "bought": True},
+                {"id": 2, "label": "AH Mayonaise (500 ml)", "price": 1.99, "nutriscore": "E"}]
+        for patch in (mock.patch.object(server, "search", return_value=hits),
+                      mock.patch.object(server, "nutrition", return_value={2: {"protein": "1.0 g", "fat": "78.0 g"}}),
+                      mock.patch.object(server, "llm", side_effect=lambda system, prompt: (
+                          self.prompts.append(prompt) or {"pick": 1, "sure": True})),
+                      mock.patch.object(server, "log")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_the_prompt_carries_preferences_price_bonus_and_nutrition(self):
+        server.preferences(self.con, add="Hellmann's   for mayonnaise")
+        self.assertEqual(server.product(self.con, "mayo")["id"], 1)
+        for text in ("- Hellmann's for mayonnaise", "€3.49 on bonus (2e halve prijs)", "Nutri-Score E",
+                     "protein 1.0 g, fat 78.0 g", "bought before"):
+            self.assertIn(text, self.prompts[-1])
+
+    def test_a_new_preference_redoes_llm_picks_but_keeps_maps(self):
+        server.save_product(self.con, "ketchup", 9, "Heinz", True, "manual")
+        for _ in range(2):
+            server.product(self.con, "mayo")
+            server.product(self.con, "ketchup")
+        self.assertEqual(len(self.prompts), 1)
+        server.preferences(self.con, add="Heinz for ketchup")
+        server.product(self.con, "mayo")
+        self.assertEqual(server.product(self.con, "ketchup")["id"], 9)
+        self.assertEqual(len(self.prompts), 2)
+        self.assertEqual(server.preferences(self.con, remove=1), [])
+        with self.assertRaises(ValueError):
+            server.preferences(self.con, remove=1)
+
+
+class Commands(unittest.TestCase):
+    def setUp(self):
+        self.con = fresh_db(self)
+        self.replies, self.history = [], []
+        hits = [{"id": 220739, "label": "Calvé Pindakaas (350 g)"}]
+        for patch in (mock.patch.object(server, "slack", side_effect=self.reply),
+                      mock.patch.object(server, "slack_call", side_effect=self.history_since),
+                      mock.patch.object(server, "search", return_value=hits),
+                      mock.patch.object(server, "lookup", return_value=hits[0]["label"])):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def reply(self, text, thread=None):
+        self.replies.append((text, thread))
+
+    def history_since(self, method, body=None, query=None):
+        return {"ok": True, "messages": [m for m in self.history if float(m["ts"]) > float(query["oldest"])]}
+
+    def test_commands_in_the_channel_are_answered_in_their_thread(self):
+        server.commands(self.con)  # the first run only notes where to start
+        now = time.time()
+        texts = ["Map pindakaas 220739", "map shampoo none", "search pindakaas", "prefer M&amp;M's for chocolate",
+                 "unprefer 5", "what's for dinner?"]
+        self.history = [{"ts": f"{now + n + 1:.6f}", "user": "UPERSON", "text": t} for n, t in enumerate(texts)]
+        self.history.append({"ts": f"{now + 9:.6f}", "user": "UBOT", "bot_id": "B1", "text": "map melk 1"})
+        server.commands(self.con)
+        server.commands(self.con)  # nothing is answered twice
+        self.assertEqual([thread for _, thread in self.replies], [m["ts"] for m in self.history[:5]])
+        answers = [text for text, _ in self.replies]
+        self.assertEqual(answers[:4], ["pindakaas: Calvé Pindakaas (350 g)", "shampoo: not from AH",
+                                       "220739 Calvé Pindakaas (350 g)", "1. M&M's for chocolate"])
+        self.assertIn("no preference 5", answers[4])
+        self.assertEqual(server.product(self.con, "pindakaas")["id"], 220739)
+
+
+class Specials(unittest.TestCase):
+    def setUp(self):
+        self.con = fresh_db(self)
+        self.posts, self.calls, self.lines, self.taps = [], [], {}, {}
+        soon = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 3 * 86400))
+        deals = [{"id": 7, "label": "Hellmann's (430 ml)", "price": 1.75, "bonus": "2e halve prijs", "until": soon},
+                 {"id": 8, "label": "AH melk (1 l)", "price": 1.05, "bonus": "5% volume voordeel", "until": "2999-12-31"}]
+        for patch in (mock.patch.object(server, "WRITE", True),
+                      mock.patch.object(server, "slack", side_effect=self.post),
+                      mock.patch.object(server, "slack_call", side_effect=self.slack_call),
+                      mock.patch.object(server, "bot_user", return_value="UBOT"),
+                      mock.patch.object(server, "products_by_id", return_value=deals),
+                      mock.patch.object(server, "user_token", return_value="token"),
+                      mock.patch.object(server, "basket", side_effect=lambda token: ({}, dict(self.lines))),
+                      mock.patch.object(server, "booked", return_value=""),
+                      mock.patch.object(server, "add_items", side_effect=lambda token, q: self.lines.update(q)),
+                      mock.patch.object(server, "log")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        server.save_product(self.con, "mayo", 7, "Hellmann's (430 ml)", True, "manual")
+        server.save_product(self.con, "melk", 8, "AH melk (1 l)", True, "llm")
+        server.save_product(self.con, "iets raars", 9, "AH Iets (1 st)", False, "llm")
+
+    def post(self, text, thread=None):
+        self.posts.append((text, thread))
+        return f"t{len(self.posts)}"
+
+    def slack_call(self, method, body=None, query=None):
+        self.calls.append((method, body))
+        replies = [{"ts": ts, "reactions": [{"name": "shopping_trolley", "users": users}]}
+                   for ts, users in self.taps.items()]
+        return {"ok": True, "messages": replies}
+
+    def test_specials_go_out_once_a_week_and_a_tap_adds_one(self):
+        server.sync([])
+        server.sync([])
+        self.assertCountEqual(server.products_by_id.call_args.args[0], [7, 8])  # not the unsure guess
+        self.assertEqual([thread for _, thread in self.posts], [None, "t1"])  # one header, one deal
+        self.assertIn(("reactions.add", {"name": "shopping_trolley", "timestamp": "t2"}), self.calls)
+        self.taps["t2"] = ["UBOT"]
+        server.sync([])
+        self.assertEqual(self.lines, {})  # the bot's own 🛒 is not a yes
+        self.taps["t2"] = ["UBOT", "UPERSON"]
+        server.sync([])
+        server.sync([])
+        self.assertEqual(self.lines, {7: 1})
+        self.assertIn(("reactions.add", {"name": "white_check_mark", "timestamp": "t2"}), self.calls)
+        self.assertIn("on bonus: Hellmann's", self.posts[-1][0])
 
 
 class Tokens(unittest.TestCase):
